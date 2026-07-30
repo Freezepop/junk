@@ -33,9 +33,13 @@ warnings.filterwarnings(
     category=CryptographyDeprecationWarning,
 )
 
+
+# All values can be overridden without changing the script.
 ZABBIX_TIMEOUT = float(os.getenv("SSL_CHECKER_ZABBIX_TIMEOUT", "10"))
-HTTP_TIMEOUT = float(os.getenv("SSL_CHECKER_HTTP_TIMEOUT", "10"))
-TOTAL_TIMEOUT = float(os.getenv("SSL_CHECKER_TOTAL_TIMEOUT", "50"))
+ISSUER_TIMEOUT = float(os.getenv("SSL_CHECKER_ISSUER_TIMEOUT", "20"))
+OCSP_TIMEOUT = float(os.getenv("SSL_CHECKER_OCSP_TIMEOUT", "35"))
+CRL_TIMEOUT = float(os.getenv("SSL_CHECKER_CRL_TIMEOUT", "35"))
+TOTAL_TIMEOUT = float(os.getenv("SSL_CHECKER_TOTAL_TIMEOUT", "90"))
 MAX_WORKERS = max(1, int(os.getenv("SSL_CHECKER_MAX_WORKERS", "4")))
 
 CACHE_DIR = os.getenv(
@@ -108,6 +112,7 @@ class FileCache:
                 os.R_OK | os.W_OK | os.X_OK,
             )
         except OSError:
+            # Cache failure must not break certificate checking.
             return False
 
     @staticmethod
@@ -343,6 +348,7 @@ def gateway_request(
     content_type=None,
     cache_ttl=0,
     maximum_bytes=MAX_CRL_BYTES,
+    operation_timeout=None,
 ):
     proxy_url = build_gateway_url(target_url, gateway)
 
@@ -357,7 +363,7 @@ def gateway_request(
         headers["Accept"] = "application/ocsp-response"
 
     def fetch():
-        timeout = deadline.remaining(HTTP_TIMEOUT)
+        timeout = deadline.remaining(operation_timeout)
         request = urllib.request.Request(
             proxy_url,
             data=data,
@@ -385,9 +391,11 @@ def download_url(url, gateway, deadline, resource_type):
     if resource_type == "issuer":
         cache_ttl = ISSUER_CACHE_TTL
         maximum_bytes = MAX_ISSUER_BYTES
+        operation_timeout = ISSUER_TIMEOUT
     elif resource_type == "crl":
         cache_ttl = CRL_CACHE_TTL
         maximum_bytes = MAX_CRL_BYTES
+        operation_timeout = CRL_TIMEOUT
     else:
         raise ValueError("unsupported resource type: " + resource_type)
 
@@ -398,6 +406,7 @@ def download_url(url, gateway, deadline, resource_type):
         method="GET",
         cache_ttl=cache_ttl,
         maximum_bytes=maximum_bytes,
+        operation_timeout=operation_timeout,
     )
 
 
@@ -411,6 +420,7 @@ def post_ocsp_request(ocsp_url, data, gateway, deadline):
         content_type="application/ocsp-request",
         cache_ttl=OCSP_CACHE_TTL,
         maximum_bytes=MAX_OCSP_BYTES,
+        operation_timeout=OCSP_TIMEOUT,
     )
 
 
@@ -757,6 +767,7 @@ def check_revocation(
     issuer_results = _run_parallel_ordered(issuer_tasks)
 
     ocsp_tasks = []
+    ocsp_task_keys = {}
     ocsp_task_positions = {}
 
     for issuer_index, issuer_url in enumerate(issuer_urls):
@@ -768,20 +779,32 @@ def check_revocation(
         issuer_cert = value
 
         for ocsp_index, ocsp_url in enumerate(ocsp_urls):
-            task_index = len(ocsp_tasks)
-            ocsp_task_positions[(issuer_index, ocsp_index)] = task_index
-            ocsp_tasks.append(
-                lambda issuer_cert=issuer_cert,
-                issuer_url=issuer_url,
-                ocsp_url=ocsp_url: _check_one_ocsp(
-                    cert,
-                    issuer_cert,
-                    issuer_url,
-                    ocsp_url,
-                    gateway,
-                    deadline,
-                )
+            # caIssuers often contains several mirrors of the same issuer.
+            # Do not send the same OCSP request several times just because
+            # that issuer certificate was downloaded from different URLs.
+            task_key = (
+                issuer_cert.fingerprint(hashes.SHA256()),
+                ocsp_url,
             )
+            task_index = ocsp_task_keys.get(task_key)
+
+            if task_index is None:
+                task_index = len(ocsp_tasks)
+                ocsp_task_keys[task_key] = task_index
+                ocsp_tasks.append(
+                    lambda issuer_cert=issuer_cert,
+                    issuer_url=issuer_url,
+                    ocsp_url=ocsp_url: _check_one_ocsp(
+                        cert,
+                        issuer_cert,
+                        issuer_url,
+                        ocsp_url,
+                        gateway,
+                        deadline,
+                    )
+                )
+
+            ocsp_task_positions[(issuer_index, ocsp_index)] = task_index
 
     ocsp_results = _run_parallel_ordered(ocsp_tasks)
 
@@ -809,7 +832,8 @@ def check_revocation(
             success, value = ocsp_results[result_index]
 
             if success:
-                result = value
+                result = dict(value)
+                result["issuer_url"] = issuer_url
                 checked_ocsp.append(result)
 
                 if result["status"] == "revoked":
