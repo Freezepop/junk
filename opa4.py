@@ -4,25 +4,23 @@ import datetime
 import socket
 import struct
 import sys
-import warnings
+import zlib
 
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
-from cryptography.utils import CryptographyDeprecationWarning
 
-
-warnings.filterwarnings(
-    "ignore",
-    category=CryptographyDeprecationWarning
-)
 
 ZABBIX_TIMEOUT = 5
-MAX_RESPONSE_SIZE = 10 * 1024 * 1024
+MAX_RESPONSE_SIZE = 64 * 1024 * 1024
+
+ZBX_PROTOCOL_FLAG = 0x01
+ZBX_COMPRESS_FLAG = 0x02
+ZBX_LARGE_PACKET_FLAG = 0x04
 
 
 def recv_exact(sock, length):
     """
-    Получает из сокета ровно указанное количество байт.
+    Получает из сокета ровно length байт.
     """
     chunks = []
     received = 0
@@ -32,7 +30,8 @@ def recv_exact(sock, length):
 
         if not chunk:
             raise ConnectionError(
-                "Zabbix Agent closed the connection prematurely"
+                "Zabbix Agent closed connection prematurely: "
+                "received {} of {} bytes".format(received, length)
             )
 
         chunks.append(chunk)
@@ -41,29 +40,166 @@ def recv_exact(sock, length):
     return b"".join(chunks)
 
 
-def zabbix_get(host, path, mode, port):
+def quote_zabbix_parameter(value):
     """
-    Получает значение vfs.file.exists[] или vfs.file.contents[]
-    непосредственно от Zabbix Agent.
+    Помещает параметр ключа Zabbix в двойные кавычки.
 
-    host может быть DNS-именем, IPv4 или IPv6.
-    PTR-запись не требуется.
+    Подходит для:
+      - Linux-путей;
+      - Windows-путей;
+      - пробелов;
+      - кириллицы;
+      - запятых и квадратных скобок.
+
+    Обратные слеши Windows-пути не удваиваются.
     """
-    key = "vfs.file.{}[{}]".format(mode, path)
-    key_bytes = key.encode("UTF-8")
+    if "\x00" in value:
+        raise ValueError("File path contains a null byte")
 
-    request = (
-        struct.pack(
-            "<4sBQ",
-            b"ZBXD",
-            1,
-            len(key_bytes)
-        )
-        + key_bytes
+    return '"{}"'.format(
+        value.replace('"', '\\"')
     )
 
-    # create_connection самостоятельно разрешает DNS,
-    # принимает IPv4/IPv6 и перебирает полученные адреса.
+
+def build_zabbix_request(key):
+    """
+    Формирует запрос Zabbix:
+
+      ZBXD
+      flags
+      data length: uint32
+      reserved: uint32
+      payload
+    """
+    key_bytes = key.encode("UTF-8")
+
+    if len(key_bytes) > 0xFFFFFFFF:
+        raise ValueError("Zabbix request is too large")
+
+    header = (
+        b"ZBXD"
+        + bytes([ZBX_PROTOCOL_FLAG])
+        + struct.pack(
+            "<II",
+            len(key_bytes),
+            0
+        )
+    )
+
+    return header + key_bytes
+
+
+def receive_zabbix_response(sock):
+    """
+    Получает и разбирает ответ Zabbix Agent.
+    """
+    prefix = recv_exact(sock, 5)
+
+    magic = prefix[:4]
+    flags = prefix[4]
+
+    if magic != b"ZBXD":
+        raise RuntimeError(
+            "Invalid Zabbix response header: {!r}".format(magic)
+        )
+
+    if not flags & ZBX_PROTOCOL_FLAG:
+        raise RuntimeError(
+            "Response does not contain Zabbix protocol flag: "
+            "0x{:02x}".format(flags)
+        )
+
+    if flags & ZBX_LARGE_PACKET_FLAG:
+        lengths = recv_exact(sock, 16)
+
+        data_length, reserved_length = struct.unpack(
+            "<QQ",
+            lengths
+        )
+    else:
+        lengths = recv_exact(sock, 8)
+
+        data_length, reserved_length = struct.unpack(
+            "<II",
+            lengths
+        )
+
+    if data_length > MAX_RESPONSE_SIZE:
+        raise RuntimeError(
+            "Zabbix Agent response is too large: {} bytes".format(
+                data_length
+            )
+        )
+
+    response = recv_exact(sock, data_length)
+
+    if flags & ZBX_COMPRESS_FLAG:
+        try:
+            response = zlib.decompress(response)
+        except zlib.error as error:
+            raise RuntimeError(
+                "Cannot decompress Zabbix response: {}".format(error)
+            )
+
+        if len(response) > MAX_RESPONSE_SIZE:
+            raise RuntimeError(
+                "Uncompressed Zabbix response is too large: "
+                "{} bytes".format(len(response))
+            )
+
+        if (
+            reserved_length != 0
+            and len(response) != reserved_length
+        ):
+            raise RuntimeError(
+                "Invalid uncompressed response length: "
+                "expected {}, received {}".format(
+                    reserved_length,
+                    len(response)
+                )
+            )
+
+    if response.startswith(b"ZBX_NOTSUPPORTED"):
+        message = response.decode(
+            "UTF-8",
+            errors="replace"
+        ).replace("\x00", ": ").strip()
+
+        raise RuntimeError(message)
+
+    return response
+
+
+def zabbix_get(host, path, mode, port):
+    """
+    Получает значение через Zabbix Agent.
+
+    host:
+      - DNS;
+      - IPv4;
+      - IPv6.
+
+    path:
+      - Linux;
+      - Windows;
+      - Unicode/кириллица.
+    """
+    if mode not in ("exists", "contents"):
+        raise ValueError(
+            "Unsupported vfs.file mode: {}".format(mode)
+        )
+
+    quoted_path = quote_zabbix_parameter(path)
+
+    key = "vfs.file.{}[{}]".format(
+        mode,
+        quoted_path
+    )
+
+    request = build_zabbix_request(key)
+
+    # DNS, IPv4 и IPv6 обрабатываются автоматически.
+    # Обратного PTR-запроса здесь нет.
     with socket.create_connection(
         (host, int(port)),
         timeout=ZABBIX_TIMEOUT
@@ -71,62 +207,29 @@ def zabbix_get(host, path, mode, port):
         sock.settimeout(ZABBIX_TIMEOUT)
         sock.sendall(request)
 
-        response_header = recv_exact(sock, 13)
-
-        magic, version, response_length = struct.unpack(
-            "<4sBQ",
-            response_header
-        )
-
-        if magic != b"ZBXD":
-            raise RuntimeError(
-                "Invalid Zabbix protocol header: {!r}".format(magic)
-            )
-
-        if version != 1:
-            raise RuntimeError(
-                "Unsupported Zabbix protocol version: {}".format(
-                    version
-                )
-            )
-
-        if response_length > MAX_RESPONSE_SIZE:
-            raise RuntimeError(
-                "Zabbix Agent response is too large: {} bytes".format(
-                    response_length
-                )
-            )
-
-        response = recv_exact(sock, response_length)
-
-    if response.startswith(b"ZBX_NOTSUPPORTED"):
-        error = response.decode(
-            "UTF-8",
-            errors="replace"
-        ).replace("\x00", ": ")
-
-        raise RuntimeError(error)
-
-    return response
+        return receive_zabbix_response(sock)
 
 
 def get_certificate_days_left(pem_data):
     """
-    Возвращает количество полных суток до стандартного
+    Вычисляет количество полных суток до стандартного
     поля notAfter сертификата.
 
-    Расширение Private Key Usage Period (2.5.29.16)
-    никак не учитывается.
+    Расширение 2.5.29.16 не используется.
     """
     cert = x509.load_pem_x509_certificate(
         pem_data,
         default_backend()
     )
 
-    # В новых версиях cryptography это timezone-aware поле.
-    not_after = getattr(cert, "not_valid_after_utc", None)
+    # Новые версии cryptography.
+    not_after = getattr(
+        cert,
+        "not_valid_after_utc",
+        None
+    )
 
-    # Совместимость со старыми версиями cryptography.
+    # Старые версии cryptography.
     if not_after is None:
         not_after = cert.not_valid_after
 
@@ -139,10 +242,15 @@ def get_certificate_days_left(pem_data):
                 datetime.timezone.utc
             )
 
-    now = datetime.datetime.now(datetime.timezone.utc)
-    seconds_left = (not_after - now).total_seconds()
+    now = datetime.datetime.now(
+        datetime.timezone.utc
+    )
 
-    # Сохраняем поведение старого скрипта:
+    seconds_left = (
+        not_after - now
+    ).total_seconds()
+
+    # Такое же округление, как в старом скрипте:
     # неполные сутки отбрасываются.
     return int(seconds_left / 86400)
 
@@ -150,9 +258,8 @@ def get_certificate_days_left(pem_data):
 def main():
     if len(sys.argv) != 4:
         print(
-            "Usage: {} <certificate_path> <host_or_ip> <port>".format(
-                sys.argv[0]
-            )
+            "Usage: {} <certificate_path> "
+            "<host_or_ip> <port>".format(sys.argv[0])
         )
         return 1
 
@@ -161,6 +268,11 @@ def main():
 
     try:
         port = int(sys.argv[3])
+
+        if not 1 <= port <= 65535:
+            raise ValueError(
+                "Invalid TCP port: {}".format(port)
+            )
 
         exists_response = zabbix_get(
             host=host,
@@ -172,7 +284,7 @@ def main():
         exists_value = exists_response.decode(
             "UTF-8",
             errors="replace"
-        ).strip()
+        ).strip("\x00\r\n ")
 
         if exists_value == "0":
             raise RuntimeError(
@@ -193,16 +305,17 @@ def main():
             port=port
         )
 
-        days_left = get_certificate_days_left(pem_data)
-        print(days_left)
+        days_left = get_certificate_days_left(
+            pem_data
+        )
 
+        print(days_left)
         return 0
 
     except Exception as error:
-        # Выводим текст вместо фиктивного числового значения.
-        # Для numeric item это приведёт к состоянию Not supported.
+        # Для numeric item строка приведёт к Not supported.
         print(
-            "ssl_certificate_expiration.py: {}".format(error)
+            "ssl_container.py: {}".format(error)
         )
         return 1
 
